@@ -1,138 +1,142 @@
 import os
-from typing import Annotated, TypedDict, Literal
+import re
+import sqlite3
+from typing import TypedDict, Annotated, List, Dict, Any
 from dotenv import load_dotenv
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import MemorySaver
-
-from tools import get_order_details, search_return_policy
-
+# Load environment variables first
 load_dotenv()
 
-# ---------------------------------------------------------
-# 1. EXPANDED GRAPH STATE
-# ---------------------------------------------------------
-class ProductionState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
-    refund_amount: float
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+from tools import get_order_details, search_return_policy, execute_refund_payout
+
+# Initialize LLM
+llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0)
+
+# State schema
+class AgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
+    order_id: str
+    order_amount: float
     requires_approval: bool
-    approval_granted: bool
+    admin_approved: bool
+    execution_status: str
+    crag_retry_count: int
 
-
-# ---------------------------------------------------------
-# 2. INITIALIZE LLM & BIND TOOLS
-# ---------------------------------------------------------
-tools = [get_order_details, search_return_policy]
-llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash")
-llm_with_tools = llm.bind_tools(tools)
-
-
-# ---------------------------------------------------------
-# 3. DEFINE WORKFLOW NODES
-# ---------------------------------------------------------
-def agent_node(state: ProductionState):
-    """Router Agent Node."""
-    response = llm_with_tools.invoke(state["messages"])
-    return {"messages": [response]}
-
-def evaluate_refund_risk_node(state: ProductionState):
-    """
-    HITL Risk Evaluation Node:
-    Inspects the conversation to check if a refund over $50 is requested.
-    """
+def router_node(state: AgentState) -> AgentState:
+    """Analyze input message, extract SQL order details dynamically, and route query."""
     messages = state["messages"]
-    last_msg = messages[-1].content
+    last_message = messages[-1].content
     
-    # Handle content whether it is a string or a list of dicts/blocks from Gemini
-    if isinstance(last_msg, list):
-        text_content = " ".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in last_msg]).lower()
-    else:
-        text_content = str(last_msg).lower()
+    # Extract order ID if present and query SQL DB directly
+    match = re.search(r"ORD\d{4}", str(last_message).upper())
     
-    # Also inspect human input messages in state for context
-    full_conversation_text = " ".join([
-        str(m.content) if not isinstance(m.content, list) else " ".join([x.get("text", "") for x in m.content if isinstance(x, dict)])
-        for m in messages
-    ]).lower()
-
-    requires_approval = False
-    amount = 0.0
+    order_id = state.get("order_id", "")
+    order_amount = state.get("order_amount", 0.0)
     
-    # Trigger approval if refund or return is requested for amounts > $50
-    if "refund" in full_conversation_text or "return" in full_conversation_text:
-        if "ord1002" in full_conversation_text or "120" in full_conversation_text:
-            amount = 120.00
-            requires_approval = True
-        elif "ord1001" in full_conversation_text or "89.99" in full_conversation_text:
-            amount = 89.99
-            requires_approval = True
-
+    if match:
+        order_id = match.group(0)
+        conn = sqlite3.connect("orders.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT price FROM orders WHERE order_id = ?", (order_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            order_amount = float(row[0])
+            
     return {
-        "refund_amount": amount,
-        "requires_approval": requires_approval
+        "order_id": order_id,
+        "order_amount": order_amount,
+        "requires_approval": order_amount > 50.0,
+        "execution_status": "ROUTED"
     }
 
-def admin_approval_gate(state: ProductionState) -> Literal["agent", END]:
-    """Conditional Edge for Human-in-the-Loop."""
-    if state.get("requires_approval") and not state.get("approval_granted"):
-        print("\n⚠️ [HITL ACTION REQUIRED]: Refund exceeds $50. Execution paused for Admin Approval.")
-        return END
-    return "agent"
-
-
-# Tool Execution Node
-tool_node = ToolNode(tools=tools)
-
-
-# ---------------------------------------------------------
-# 4. CONSTRUCT PRODUCTION GRAPH
-# ---------------------------------------------------------
-builder = StateGraph(ProductionState)
-
-# Add Nodes
-builder.add_node("agent", agent_node)
-builder.add_node("tools", tool_node)
-builder.add_node("risk_evaluator", evaluate_refund_risk_node)
-
-# Add Edges
-builder.add_edge(START, "agent")
-
-# Route after agent output: either run tool or evaluate risk
-builder.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: "risk_evaluator"})
-builder.add_edge("tools", "agent")
-
-# Add Checkpointer for State Memory Persistence
-memory = MemorySaver()
-graph = builder.compile(checkpointer=memory)
-
-
-# ---------------------------------------------------------
-# 5. TEST EXECUTION WITH HITL SAFETY GATE
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    config = {"configurable": {"thread_id": "session_101"}}
+def crag_evaluator_node(state: AgentState) -> AgentState:
+    """Corrective RAG (CRAG) node: Grades retrieval quality and forces query rewriting if irrelevant."""
+    messages = state["messages"]
+    last_user_msg = [m for m in messages if isinstance(m, HumanMessage)][-1].content
     
-    print("\n--- TEST 1: Requesting High-Value Refund ($120 for ORD1002) ---")
-    query = "I want a full refund for my mechanical keyboard order ORD1002."
+    # Perform retrieval
+    context = search_return_policy.invoke({"query": str(last_user_msg)})
     
-    # Run graph execution
-    result = graph.invoke({"messages": [HumanMessage(content=query)]}, config=config)
+    # Grade context quality
+    eval_prompt = f"Does this context contain facts to answer: '{last_user_msg}'?\nContext: {context}\nReply ONLY YES or NO."
+    grade = llm.invoke(eval_prompt).content.strip().upper()
     
-    if result.get("requires_approval"):
-        print(f"Status: PAUSED | Refund Amount: ${result['refund_amount']} | Approval Needed: True")
-        
-        # Simulate Admin Approval Action
-        print("\n--- SIMULATING ADMIN APPROVAL VIA API ---")
-        admin_override = {
-            "approval_granted": True,
-            "messages": [SystemMessage(content="Admin authorized refund of $120.00 for ORD1002.")]
+    retry_count = state.get("crag_retry_count", 0)
+    
+    if "YES" in grade or retry_count >= 1:
+        # Valid retrieval or max retry reached
+        response = llm.invoke(f"Answer the query accurately using this context: {context}\nQuery: {last_user_msg}")
+        return {
+            "messages": [AIMessage(content=str(response.content))],
+            "execution_status": "COMPLETED"
+        }
+    else:
+        # Fallback: Rewrite query and retry once
+        rewritten_query = f"store return policy for {last_user_msg}"
+        fallback_context = search_return_policy.invoke({"query": rewritten_query})
+        response = llm.invoke(f"Answer using policy context: {fallback_context}\nQuery: {last_user_msg}")
+        return {
+            "messages": [AIMessage(content=str(response.content))],
+            "crag_retry_count": retry_count + 1,
+            "execution_status": "COMPLETED_WITH_FALLBACK"
+        }
+
+def hitl_evaluator_node(state: AgentState) -> AgentState:
+    """Evaluates financial risk against strict SQL amount, pausing or executing payouts."""
+    order_id = state.get("order_id", "")
+    amount = state.get("order_amount", 0.0)
+    requires_approval = state.get("requires_approval", False)
+    admin_approved = state.get("admin_approved", False)
+    
+    if not order_id:
+        return {
+            "messages": [AIMessage(content="Please provide a valid Order ID (e.g., ORD1001) to process a refund.")],
+            "execution_status": "FAILED_MISSING_ORDER"
         }
         
-        # Resume Graph State with Admin Approval
-        graph.update_state(config, admin_override)
-        updated_state = graph.get_state(config)
-        print("✅ Graph State Updated: Admin Approval Granted. System ready for payout execution.")
+    # Check threshold ($50)
+    if requires_approval and not admin_approved:
+        return {
+            "messages": [AIMessage(content=f"Refund request of ${amount:.2f} for order {order_id} exceeds automatic limit ($50.00). State PAUSED pending Admin approval.")],
+            "execution_status": "PAUSED_PENDING_APPROVAL"
+        }
+        
+    # Execute refund tool directly once authorized
+    result = execute_refund_payout.invoke({"order_id": order_id, "amount": amount})
+    return {
+        "messages": [AIMessage(content=f"Execution Update: {result}")],
+        "execution_status": "COMPLETED"
+    }
+
+def route_next_step(state: AgentState) -> str:
+    messages = state["messages"]
+    last_msg = str(messages[-1].content).lower()
+    
+    if "refund" in last_msg or state.get("order_id"):
+        return "hitl_evaluator"
+    return "crag_evaluator"
+
+# Build Graph
+builder = StateGraph(AgentState)
+builder.add_node("router", router_node)
+builder.add_node("crag_evaluator", crag_evaluator_node)
+builder.add_node("hitl_evaluator", hitl_evaluator_node)
+
+builder.set_entry_point("router")
+builder.add_conditional_edges("router", route_next_step)
+builder.add_edge("crag_evaluator", END)
+builder.add_edge("hitl_evaluator", END)
+
+# Persistent SQLite checkpointer
+conn = sqlite3.connect("checkpoints.db", check_same_thread=False)
+memory = SqliteSaver(conn)
+
+app_graph = builder.compile(checkpointer=memory)
+graph = app_graph
