@@ -1,32 +1,35 @@
 import sqlite3
 
-def init_sql_db():
+def init_db():
     conn = sqlite3.connect("orders.db")
     cursor = conn.cursor()
     
-    # Create Orders Table
+    # Drop table if exists to reset schema cleanly
+    cursor.execute("DROP TABLE IF EXISTS orders")
+    
+    # Create orders table with price column
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS orders (
-        order_id TEXT PRIMARY KEY,
-        customer_id TEXT,
-        item_name TEXT,
-        amount REAL,
-        status TEXT,
-        delivery_date TEXT
-    )
+        CREATE TABLE orders (
+            order_id TEXT PRIMARY KEY,
+            customer_name TEXT NOT NULL,
+            item TEXT NOT NULL,
+            price REAL NOT NULL,
+            status TEXT NOT NULL
+        )
     """)
     
-    # Seed Mock Data
-    sample_orders = [
-        ("ORD1001", "CUST01", "Wireless Headphones", 89.99, "Delivered", "2026-03-01"),
-        ("ORD1002", "CUST02", "Mechanical Keyboard", 120.00, "Delivered", "2026-03-10"),
-        ("ORD1003", "CUST01", "USB-C Hub", 35.50, "In Transit", "2026-03-24")
+    # Insert test order records
+    test_orders = [
+        ("ORD1001", "Alice Smith", "Wireless Headphones", 29.99, "DELIVERED"),
+        ("ORD1002", "Bob Jones", "4K Gaming Monitor", 120.00, "DELIVERED"),
+        ("ORD1003", "Charlie Brown", "USB-C Cable", 15.00, "SHIPPED")
     ]
     
-    cursor.executemany("INSERT OR REPLACE INTO orders VALUES (?, ?, ?, ?, ?, ?)", sample_orders)
+    cursor.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", test_orders)
+    
     conn.commit()
     conn.close()
-    print("✅ SQL Database (orders.db) successfully created with sample orders!")
+    print("Database re-initialized successfully with 'price' column!")
 
 if __name__ == "__main__":
-    init_sql_db()
+    init_db()
