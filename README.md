@@ -1,41 +1,36 @@
-# Enterprise Agentic Customer Support & Operations Engine
+# Enterprise Agentic Operations Engine
 
-A production-grade microservice built with **FastAPI**, **LangGraph**, **ChromaDB**, **SQLite**, and **Docker**. 
-
-Features an **Agentic RAG pipeline** with dynamic tool calling, **Corrective RAG (CRAG)** context evaluation, and a **Human-in-the-Loop (HITL)** approval gate for high-risk financial transactions.
+A stateful customer operations engine built with **LangGraph**, **FastAPI**, and **SQLite**. The system evaluates transactional risk dynamically using relational SQL data, enforces human-in-the-loop (HITL) safety controls for high-value refunds, and maintains state checkpoints on disk.
 
 ---
 
-## 🛠️ System Architecture
+## 🏛 Architecture Overview
 
 ```text
-               ┌───────────────────────────┐
-               │    Incoming User Query    │
-               └─────────────┬─────────────┘
-                             │
-                ┌────────────▼────────────┐
-                │  LangGraph Router Node  │
-                └─┬─────────────────────┬─┘
-                  │                     │
-(Policy Question) │                     │ (Order/Refund Query)
-                  ▼                     ▼
-       ┌──────────────────┐    ┌──────────────────┐
-       │ Chroma Vector DB │    │  SQLite Database │
-       │  (Policy Docs)   │    │  (Orders Table)  │
-       └─────────┬────────┘    └────────┬─────────┘
-                 │                      │
-                 └──────────┬───────────┘
-                            │
-               ┌────────────▼────────────┐
-               │ Context Evaluator (CRAG)│
-               └────────────┬────────────┘
-                            │
-               ┌────────────▼────────────┐
-               │ Refund > $50 Threshold? │
-               └─┬─────────────────────┬─┘
-                 │ YES                 │ NO
-                 ▼                     ▼
-      ┌────────────────────┐  ┌──────────────────┐
-      │ Pause State (HITL) │  │ Auto-Execute API │
-      │ Admin Approval Req │  │   & Respond      │
-      └────────────────────┘  └──────────────────┘
+                        ┌────────────────────────┐
+                        │   Incoming User Chat   │
+                        └───────────┬────────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │   Router Node       │
+                         │ (Extract Order ID)  │
+                         └──────────┬──────────┘
+                                    │
+                 ┌──────────────────┴──────────────────┐
+                 │                                     │
+                 ▼                                     ▼
+      ┌──────────────────────┐              ┌──────────────────────┐
+      │  CRAG Evaluator Node │              │  HITL Evaluator Node │
+      │  (Vector Search DB)  │              │  (SQL Price Gate)    │
+      └──────────────────────┘              └──────────┬───────────┘
+                                                       │
+                                            ┌──────────┴──────────┐
+                                            │                     │
+                                            ▼                     ▼
+                                     [Refund <= $50]       [Refund > $50]
+                                            │                     │
+                                            ▼                     ▼
+                                    ┌──────────────┐      ┌──────────────┐
+                                    │ Auto-Execute │      │ State PAUSED │
+                                    │ Payout Tool  │      │ Admin Approvr│
+                                    └──────────────┘      └──────────────┘
